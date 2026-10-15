@@ -1,0 +1,14 @@
+# Rust 构建产物
+/target
+
+# 运行时数据：连接配置，其中密码由本机 DPAPI 加密，不可跨用户/跨机器使用
+connections.json
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.swp
+
+# 操作系统生成
+Thumbs.db
+Desktop.ini
