@@ -2,6 +2,7 @@
 name = "rdm-rust"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 gpui-kit = "0.7.3"
