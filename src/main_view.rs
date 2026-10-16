@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -72,6 +73,70 @@ impl Render for ErrorNotice {
     }
 }
 
+/// 拖拽负载：被拖动的服务器
+#[derive(Clone)]
+struct DragServer {
+    id: String,
+    name: String,
+}
+
+impl Render for DragServer {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 跟随光标的拖拽预览
+        h_flex()
+            .px_3()
+            .py_1p5()
+            .rounded_md()
+            .text_sm()
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .border_1()
+            .border_color(cx.theme().border)
+            .shadow_md()
+            .child(self.name.clone())
+    }
+}
+
+/// 拖拽负载：被拖动的分组
+#[derive(Clone)]
+struct DragGroup {
+    name: String,
+}
+
+impl Render for DragGroup {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .px_3()
+            .py_1p5()
+            .rounded_md()
+            .text_sm()
+            .font_weight(FontWeight::SEMIBOLD)
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .border_1()
+            .border_color(cx.theme().border)
+            .shadow_md()
+            .child(self.name.clone())
+    }
+}
+
+/// 拖拽落点
+#[derive(Clone, PartialEq)]
+enum DropTarget {
+    /// 插入到某台服务器之前（after = false）或之后（after = true）
+    Row { id: String, after: bool },
+    /// 追加到某个分组末尾
+    Group(String),
+    /// 重排分组：插到某分组之前（after = false）或之后（after = true）。
+    /// `origin` 记录落点由哪个元素设置（分组标题为 None，服务器行为自身 id），
+    /// 用于让各元素只清除自己设置的落点。
+    GroupOrder {
+        group: String,
+        after: bool,
+        origin: Option<String>,
+    },
+}
+
 pub struct MainView {
     store: Store,
     selected: Option<String>,
@@ -80,6 +145,10 @@ pub struct MainView {
     collapsed: HashSet<String>,
     /// 服务器列表滚动控制，绑定滚动条
     list_scroll: ScrollHandle,
+    /// 拖拽落点（拖动过程中实时更新）
+    drop_target: Option<DropTarget>,
+    /// 拖拽到列表边缘时每个 tick 的滚动量（0 表示不滚动）
+    auto_scroll: f32,
     editor: Option<ServerEditor>,
     error_notice: Entity<ErrorNotice>,
     group_input: Option<Entity<InputState>>,
@@ -98,6 +167,8 @@ impl MainView {
             latency: HashMap::new(),
             collapsed: HashSet::new(),
             list_scroll: ScrollHandle::new(),
+            drop_target: None,
+            auto_scroll: 0.,
             editor: None,
             error_notice: cx.new(|_| ErrorNotice { message: None }),
             group_input: None,
@@ -122,6 +193,125 @@ impl MainView {
             notice.message = None;
             cx.notify();
         });
+    }
+
+    // ---------- 拖拽排序 / 换组 ----------
+
+    /// 把落点换算成「目标分组 + 组内插入序号」
+    fn drop_position(&self, target: &DropTarget) -> Option<(String, usize)> {
+        match target {
+            DropTarget::Group(group) => Some((
+                group.clone(),
+                self.store.servers.iter().filter(|s| &s.group == group).count(),
+            )),
+            DropTarget::Row { id, after } => {
+                let row = self.store.find(id)?;
+                let group = row.group.clone();
+                let index = self
+                    .store
+                    .servers
+                    .iter()
+                    .filter(|s| s.group == group)
+                    .take_while(|s| &s.id != id)
+                    .count();
+                Some((group, index + usize::from(*after)))
+            }
+            // 分组重排的落点不对服务器生效
+            DropTarget::GroupOrder { .. } => None,
+        }
+    }
+
+    /// 完成放置：移动服务器（换组 + 排序）并持久化
+    fn finish_drop(&mut self, dragged_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.drop_target.take();
+        self.auto_scroll = 0.;
+        let Some(target) = target else {
+            return;
+        };
+        let Some((group, index)) = self.drop_position(&target) else {
+            return;
+        };
+        if !self.store.move_server(dragged_id, &group, index) {
+            return;
+        }
+        if let Err(e) = store::save(&self.store) {
+            window.push_notification(Notification::error(format!("保存失败: {e}")), cx);
+        }
+        cx.notify();
+    }
+
+    /// 完成分组重排并持久化
+    fn finish_group_drop(&mut self, dragged: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.drop_target.take();
+        self.auto_scroll = 0.;
+        let Some(DropTarget::GroupOrder { group, after, .. }) = target else {
+            return;
+        };
+        let names = self.store.group_names();
+        let Some(pos) = names.iter().position(|g| g == &group) else {
+            return;
+        };
+        let index = pos + usize::from(after);
+        if !self.store.move_group(dragged, index) {
+            return;
+        }
+        if let Err(e) = store::save(&self.store) {
+            window.push_notification(Notification::error(format!("保存失败: {e}")), cx);
+        }
+        cx.notify();
+    }
+
+    /// 拖拽到列表上下边缘时自动滚动。
+    ///
+    /// 光标停在边缘不动时不会再有 mouse move 事件，所以用定时任务持续推进。
+    /// 监听挂在根元素上，坐标与列表可视区比较：光标离开列表即停止滚动。
+    fn update_auto_scroll(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        const EDGE: f32 = 40.;
+        const SPEED: f32 = 12.;
+        let bounds = self.list_scroll.bounds();
+        let dir = if !bounds.contains(&position) {
+            0.
+        } else if position.y < bounds.top() + px(EDGE) {
+            // 向上滚：offset 增大（趋近 0）
+            -SPEED
+        } else if position.y > bounds.bottom() - px(EDGE) {
+            // 向下滚：offset 变小（更负）
+            SPEED
+        } else {
+            0.
+        };
+        if dir != self.auto_scroll {
+            self.auto_scroll = dir;
+            if dir != 0. {
+                self.start_auto_scroll(cx);
+            }
+        }
+    }
+
+    fn start_auto_scroll(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let executor = cx.background_executor().clone();
+            loop {
+                executor.timer(Duration::from_millis(16)).await;
+                let keep_going = this.update(cx, |this, cx| {
+                    if !cx.has_active_drag() {
+                        this.auto_scroll = 0.;
+                    }
+                    if this.auto_scroll == 0. {
+                        return false;
+                    }
+                    let mut offset = this.list_scroll.offset();
+                    offset.y = offset.y - px(this.auto_scroll);
+                    this.list_scroll.set_offset(offset);
+                    cx.notify();
+                    true
+                });
+                if !matches!(keep_going, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     // ---------- 延迟检测 ----------
@@ -1072,6 +1262,10 @@ impl MainView {
         let collapsed = self.collapsed.contains(group);
         let text_color = cx.theme().muted_foreground;
         let hover_bg = cx.theme().list_hover;
+        let drop_bg = cx.theme().list_active;
+        // 拖拽悬停在本分组标题上时高亮，表示「放进这个分组」
+        let is_drop_group = cx.has_active_drag()
+            && matches!(&self.drop_target, Some(DropTarget::Group(g)) if g.as_str() == group);
         h_flex()
             .id(SharedString::from(format!("grp-{group}")))
             .px_3()
@@ -1083,7 +1277,71 @@ impl MainView {
             .text_sm()
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(text_color)
+            .when(is_drop_group, |d| d.bg(drop_bg))
             .hover(|d| d.bg(hover_bg))
+            .on_drag(
+                DragGroup {
+                    name: group_name.clone(),
+                },
+                |drag, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| drag.clone())
+                },
+            )
+            .on_drag_move::<DragServer>(cx.listener({
+                let group = group_name.clone();
+                move |this, e: &DragMoveEvent<DragServer>, _window, cx| {
+                    // on_drag_move 会对所有注册了监听的元素触发（不限于光标所在元素，
+                    // 且执行顺序不定），因此只在光标确实落在本标题上时才设置落点；
+                    // 否则仅当当前落点仍指向本分组时才清空，避免清掉别处刚设置的落点
+                    let hovering = e.bounds.contains(&e.event.position);
+                    let target = if hovering {
+                        // 落到分组标题上 = 追加到该分组末尾
+                        Some(DropTarget::Group(group.clone()))
+                    } else if matches!(&this.drop_target, Some(DropTarget::Group(g)) if g == &group) {
+                        None
+                    } else {
+                        return;
+                    };
+                    if this.drop_target != target {
+                        this.drop_target = target;
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_drag_move::<DragGroup>(cx.listener({
+                let group = group_name.clone();
+                move |this, e: &DragMoveEvent<DragGroup>, _window, cx| {
+                    let hovering = e.bounds.contains(&e.event.position);
+                    let target = if hovering {
+                        // 拖动的就是本分组时没有意义
+                        if e.drag(cx).name == group {
+                            None
+                        } else {
+                            Some(DropTarget::GroupOrder {
+                                group: group.clone(),
+                                after: e.event.position.y >= e.bounds.center().y,
+                                origin: None,
+                            })
+                        }
+                    } else if matches!(&this.drop_target, Some(DropTarget::GroupOrder { group: g, origin: None, .. }) if g == &group)
+                    {
+                        None
+                    } else {
+                        return;
+                    };
+                    if this.drop_target != target {
+                        this.drop_target = target;
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_drop(cx.listener(|this, drag: &DragServer, window, cx| {
+                this.finish_drop(&drag.id, window, cx);
+            }))
+            .on_drop(cx.listener(|this, drag: &DragGroup, window, cx| {
+                this.finish_group_drop(&drag.name, window, cx);
+            }))
             .on_click({
                 let group = group_name.clone();
                 cx.listener(move |this, _: &ClickEvent, _window, cx| {
@@ -1173,8 +1431,17 @@ impl MainView {
             Some(Latency::Offline) => ("离线".to_string(), theme.danger),
         };
         let sid = server.id.clone();
+        // 插入位置指示线：拖拽中且本行是落点时显示
+        let drop_marker = match self.drop_target.as_ref() {
+            Some(DropTarget::Row { id, after }) if id == &server.id && cx.has_active_drag() => {
+                Some(*after)
+            }
+            _ => None,
+        };
+        let marker_color = theme.primary;
         h_flex()
             .id(SharedString::from(format!("srv-{}", server.id)))
+            .relative()
             .h(px(38.))
             // 左缩进与分组标题文字对齐：12(分组内边距) + 14(小三角) + 4(间距) = 30
             .pl(px(30.))
@@ -1184,6 +1451,80 @@ impl MainView {
             .rounded_md()
             .when(selected, |d| d.bg(theme.list_active))
             .hover(|d| d.bg(theme.list_hover))
+            .on_drag(
+                DragServer {
+                    id: server.id.clone(),
+                    name: server.name.clone(),
+                },
+                |drag, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| drag.clone())
+                },
+            )
+            .on_drag_move::<DragServer>(cx.listener({
+                let sid = server.id.clone();
+                move |this, e: &DragMoveEvent<DragServer>, _window, cx| {
+                    // on_drag_move 会对所有注册了监听的元素触发（不限于光标所在的那个，
+                    // 且执行顺序不定），所以只在光标确实位于本行时设置落点；
+                    // 不在本行时，仅当落点仍指向本行才清除，避免清掉其它行刚设置的落点
+                    let hovering = e.bounds.contains(&e.event.position);
+                    let target = if hovering {
+                        // 落在自己身上不算落点
+                        if e.drag(cx).id == sid {
+                            None
+                        } else {
+                            Some(DropTarget::Row {
+                                id: sid.clone(),
+                                after: e.event.position.y >= e.bounds.center().y,
+                            })
+                        }
+                    } else if matches!(&this.drop_target, Some(DropTarget::Row { id, .. }) if id == &sid)
+                    {
+                        None
+                    } else {
+                        return;
+                    };
+                    if this.drop_target != target {
+                        this.drop_target = target;
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_drag_move::<DragGroup>(cx.listener({
+                let sid = server.id.clone();
+                let group = server.group.clone();
+                move |this, e: &DragMoveEvent<DragGroup>, _window, cx| {
+                    // 与服务器拖拽同理：只认「光标确实在本行」时设置的落点，
+                    // 且只清除本行自己设置的落点
+                    let hovering = e.bounds.contains(&e.event.position);
+                    let target = if hovering {
+                        if e.drag(cx).name == group {
+                            None
+                        } else {
+                            Some(DropTarget::GroupOrder {
+                                group: group.clone(),
+                                after: e.event.position.y >= e.bounds.center().y,
+                                origin: Some(sid.clone()),
+                            })
+                        }
+                    } else if matches!(&this.drop_target, Some(DropTarget::GroupOrder { origin: Some(o), .. }) if o == &sid)
+                    {
+                        None
+                    } else {
+                        return;
+                    };
+                    if this.drop_target != target {
+                        this.drop_target = target;
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_drop(cx.listener(|this, drag: &DragServer, window, cx| {
+                this.finish_drop(&drag.id, window, cx);
+            }))
+            .on_drop(cx.listener(|this, drag: &DragGroup, window, cx| {
+                this.finish_group_drop(&drag.name, window, cx);
+            }))
             .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                 this.selected = Some(sid.clone());
                 if ev.click_count() >= 2 {
@@ -1284,6 +1625,42 @@ impl MainView {
                     .text_color(latency_color)
                     .child(latency_text),
             )
+            .when_some(drop_marker, |d, after| {
+                // 绝对定位的 2px 指示线：放上面或下面，不挤动内容
+                d.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .h(px(2.))
+                        .bg(marker_color)
+                        .when(after, |d| d.bottom_0())
+                        .when(!after, |d| d.top_0()),
+                )
+            })
+    }
+
+    /// 分组重排的插入指示线（画在分组整块的上/下边界处）
+    fn group_order_marker(
+        &self,
+        group: &str,
+        after: bool,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let hit = cx.has_active_drag()
+            && matches!(
+                &self.drop_target,
+                Some(DropTarget::GroupOrder { group: g, after: a, .. }) if g == group && *a == after
+            );
+        hit.then(|| {
+            // 负外边距正好抵消多出的一个 gap 与自身高度，指示线出现时列表不跳动
+            div()
+                .h(px(2.))
+                .mb(px(-6.))
+                .rounded_full()
+                .bg(cx.theme().primary)
+                .into_any_element()
+        })
     }
 
     fn render_list(
@@ -1312,6 +1689,7 @@ impl MainView {
             .py_2()
             .px_2()
             .gap_1();
+        // 分组重排的插入指示线（按整块分组画：本组之前 / 本组之后）
         for group in self.store.group_names() {
             let servers: Vec<&ServerEntry> = self
                 .store
@@ -1319,12 +1697,21 @@ impl MainView {
                 .iter()
                 .filter(|s| s.group == group)
                 .collect();
+            if let Some(marker) = self.group_order_marker(&group, false, cx) {
+                list = list.child(marker);
+            }
             list = list.child(self.render_group_header(view, &group, servers.len(), cx));
             if self.collapsed.contains(&group) {
+                if let Some(marker) = self.group_order_marker(&group, true, cx) {
+                    list = list.child(marker);
+                }
                 continue;
             }
             for server in servers {
                 list = list.child(self.render_server_row(view, server, window, cx));
+            }
+            if let Some(marker) = self.group_order_marker(&group, true, cx) {
+                list = list.child(marker);
             }
         }
         // 外层 relative 容器叠加自定义滚动条；内层列表受 flex 约束才会内部溢出滚动
@@ -1343,7 +1730,15 @@ impl Render for MainView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         v_flex()
+            .id("main-root")
             .size_full()
+            // 拖拽监听挂在这里，光标在窗口内任何位置都能更新自动滚动状态
+            .on_drag_move::<DragServer>(cx.listener(|this, e: &DragMoveEvent<DragServer>, _w, cx| {
+                this.update_auto_scroll(e.event.position, cx);
+            }))
+            .on_drag_move::<DragGroup>(cx.listener(|this, e: &DragMoveEvent<DragGroup>, _w, cx| {
+                this.update_auto_scroll(e.event.position, cx);
+            }))
             .child(self.render_toolbar(cx))
             .child(self.render_list(&view, window, cx))
     }
