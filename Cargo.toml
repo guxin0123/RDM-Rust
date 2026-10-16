@@ -20,3 +20,11 @@ windows = { version = "0.58", features = [
     "Win32_Security_Cryptography",
     "Win32_Foundation",
 ] }
+
+[profile.release]
+opt-level = "z"       # 优化代码尺寸
+lto = true            # 启用链接时优化 (Link Time Optimization)
+codegen-units = 1     # 降低代码生成单元数，增加优化时间但减少二进制大小
+panic = "abort"       # 使用 'abort' 而不是 'unwind' 来处理 panic
+strip = "debuginfo"   # 移除调试信息
+
