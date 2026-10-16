@@ -7,6 +7,7 @@ use gpui_kit::component::input::{Input, InputContentType, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::select::{Select, SelectState};
+use gpui_kit::component::scroll::Scrollbar;
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, WindowExt as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -77,6 +78,8 @@ pub struct MainView {
     latency: HashMap<String, Latency>,
     /// 已折叠的分组名（仅本次运行内有效）
     collapsed: HashSet<String>,
+    /// 服务器列表滚动控制，绑定滚动条
+    list_scroll: ScrollHandle,
     editor: Option<ServerEditor>,
     error_notice: Entity<ErrorNotice>,
     group_input: Option<Entity<InputState>>,
@@ -94,6 +97,7 @@ impl MainView {
             selected: None,
             latency: HashMap::new(),
             collapsed: HashSet::new(),
+            list_scroll: ScrollHandle::new(),
             editor: None,
             error_notice: cx.new(|_| ErrorNotice { message: None }),
             group_input: None,
@@ -1304,6 +1308,7 @@ impl MainView {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .track_scroll(&self.list_scroll)
             .py_2()
             .px_2()
             .gap_1();
@@ -1322,7 +1327,15 @@ impl MainView {
                 list = list.child(self.render_server_row(view, server, window, cx));
             }
         }
-        list.into_any_element()
+        // 外层 relative 容器叠加自定义滚动条；内层列表受 flex 约束才会内部溢出滚动
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .relative()
+            .overflow_hidden()
+            .child(list)
+            .child(Scrollbar::vertical(&self.list_scroll))
+            .into_any_element()
     }
 }
 
