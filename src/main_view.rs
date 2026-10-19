@@ -177,13 +177,11 @@ pub struct MainView {
     export_input: Option<Entity<InputState>>,
     import_password_input: Option<Entity<InputState>>,
     pending_import: Option<PendingImport>,
-    /// 本次加载时自动修复的坏数据条数（>0 时在工具栏提示）
-    repaired_ids: usize,
 }
 
 impl MainView {
     pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (store, repaired_ids) = store::load();
+        let store = store::load();
         let servers = store.servers.clone();
         let mut this = Self {
             store,
@@ -198,7 +196,6 @@ impl MainView {
             export_input: None,
             import_password_input: None,
             pending_import: None,
-            repaired_ids,
         };
         this.start_latency_check(servers, cx);
         this
@@ -279,14 +276,21 @@ impl MainView {
     // ---------- 刷新 ----------
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        let (store, repaired_ids) = store::load();
-        self.store = store;
-        self.repaired_ids = repaired_ids;
-        if let Some(id) = self.selected.take() {
-            if self.store.find(&id).is_some() {
-                self.selected = Some(id);
-            }
-        }
+        // id 是每次读取时在内存里重新生成的，所以用「名称 + 地址」把选中项找回来
+        let previous = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.store.find(id))
+            .map(|s| (s.name.clone(), s.host.clone()));
+        self.store = store::load();
+        self.latency.clear();
+        self.selected = previous.and_then(|(name, host)| {
+            self.store
+                .servers
+                .iter()
+                .find(|s| s.name == name && s.host == host)
+                .map(|s| s.id.clone())
+        });
         let servers = self.store.servers.clone();
         self.start_latency_check(servers, cx);
     }
@@ -1160,8 +1164,6 @@ impl MainView {
     // ---------- 渲染 ----------
 
     fn render_toolbar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let repaired_ids = self.repaired_ids;
-        let warning_color = cx.theme().warning;
         h_flex()
             .w_full()
             .px_3()
@@ -1248,16 +1250,6 @@ impl MainView {
                         this.open_export_dialog(window, cx);
                     })),
             )
-            .when(repaired_ids > 0, |bar| {
-                bar.child(
-                    div()
-                        .text_sm()
-                        .text_color(warning_color)
-                        .child(format!(
-                            "已自动修复 {repaired_ids} 条重复或缺失的服务器 ID（原文件已备份为 connections.json.bak）"
-                        )),
-                )
-            })
     }
 
     fn render_group_header(

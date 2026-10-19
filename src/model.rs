@@ -6,9 +6,12 @@ pub const DEFAULT_GROUP: &str = "默认";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerEntry {
-    /// 服务器唯一标识。历史数据里这个字段可能缺失或整批重复，读取时由
-    /// [`Store::repair`] 兜底修复。
-    #[serde(default)]
+    /// 会话内的唯一标识，**不写入配置文件**：每次读取数据时在内存里重新生成。
+    ///
+    /// 增删改、连接和拖拽排序都靠它定位，所以它只要在本次运行内唯一就够了。
+    /// 不落盘的好处：人工编辑 connections.json 时完全不用操心这个字段，也不会再出现
+    /// 历史版本那种「整批服务器共用同一个 id」导致的操作错乱（详见 [`Store::assign_ids`]）。
+    #[serde(skip)]
     pub id: String,
     #[serde(default)]
     pub group: String,
@@ -38,33 +41,25 @@ pub struct Store {
 }
 
 impl Store {
-    /// 修复历史数据里的坏值，返回被修复的服务器数量。
+    /// 给每台服务器分配一个本次运行内唯一的 id，并把空分组名归入默认分组。
     ///
-    /// `id` 是服务器在增删改、连接、拖拽排序时唯一的身份依据。历史数据中出现过
-    /// 整批服务器共用同一个 id 的情况，此时按 id 查找只会命中第一个，表现就是
-    /// "把服务器拖到别的分组后，原来那个还在"。这里在读取时重新分配 id，并顺手
-    /// 把空分组名归入默认分组。
-    pub fn repair(&mut self) -> usize {
+    /// `id` 不落盘（`#[serde(skip)]`），所以每次读取数据后都要调用一次。id 完全在
+    /// 进程内生成，天然不会重复，也就不存在历史数据那种"整批共用同一个 id、按 id
+    /// 查找只命中第一个"的问题。
+    pub fn assign_ids(&mut self) {
         let mut seen: HashSet<String> = HashSet::new();
-        let mut repaired = 0;
         for s in self.servers.iter_mut() {
-            if s.id.is_empty() || !seen.insert(s.id.clone()) {
-                // 新 id 理论上不会撞车，仍然循环确认一次
-                loop {
-                    let candidate = new_id();
-                    if seen.insert(candidate.clone()) {
-                        s.id = candidate;
-                        break;
-                    }
+            loop {
+                let candidate = new_id();
+                if seen.insert(candidate.clone()) {
+                    s.id = candidate;
+                    break;
                 }
-                repaired += 1;
             }
             if s.group.trim().is_empty() {
                 s.group = DEFAULT_GROUP.to_string();
-                repaired += 1;
             }
         }
-        repaired
     }
 
     pub fn ensure_default_group(&mut self) {
@@ -295,10 +290,10 @@ mod tests {
         }
     }
 
-    /// 回归：历史数据里整批服务器共用同一个 id 时，按 id 查找只会命中第一个，
-    /// 拖拽就会"把 A 组的服务器拖到 B 组后，A 组那个还在"。读取时必须先修好 id。
+    /// id 只在内存里用：每次读取都重新分配，所以无论文件里留下什么 id，
+    /// 分配后都必须两两不同。
     #[test]
-    fn repair_gives_every_duplicate_id_a_new_one() {
+    fn assign_ids_makes_every_id_unique() {
         let mut store = Store {
             groups: vec![DEFAULT_GROUP.to_string(), "B".to_string()],
             servers: vec![
@@ -310,25 +305,55 @@ mod tests {
             ],
         };
 
-        let repaired = store.repair();
+        store.assign_ids();
 
-        // "same" 出现 3 次 → 后 2 个要重新分配；空 id 1 个 → 共 3 条
-        assert_eq!(repaired, 3);
-        assert_eq!(store.servers[0].id, "same", "第一个出现的不动");
+        assert!(store.servers.iter().all(|s| !s.id.is_empty()));
         let ids: HashSet<&str> = store.servers.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids.len(), store.servers.len(), "修复后 id 必须两两不同");
-        assert!(store.servers[4].id == "unique");
+        assert_eq!(ids.len(), store.servers.len(), "分配后 id 必须两两不同");
+    }
+
+    /// id 不写入配置文件：序列化结果里不能出现 id 字段。
+    #[test]
+    fn id_is_not_serialized() {
+        let mut store = Store {
+            groups: vec![DEFAULT_GROUP.to_string()],
+            servers: vec![server("x", DEFAULT_GROUP, "a")],
+        };
+        store.assign_ids();
+
+        let json = serde_json::to_string_pretty(&store).unwrap();
+        assert!(!json.contains("\"id\""), "配置文件里不应该有 id 字段: {json}");
+        assert!(json.contains("\"name\": \"a\""));
+    }
+
+    /// 旧文件里残留的 id 字段要被忽略，读取后重新分配。
+    #[test]
+    fn legacy_id_field_is_ignored_on_load() {
+        let json = r#"{
+            "groups": ["默认"],
+            "servers": [
+                {"id": "1a13f390c674c18", "group": "默认", "name": "a", "host": "a"},
+                {"id": "1a13f390c674c18", "group": "默认", "name": "b", "host": "b"}
+            ]
+        }"#;
+        let mut store: Store = serde_json::from_str(json).unwrap();
+        assert!(store.servers.iter().all(|s| s.id.is_empty()));
+
+        store.assign_ids();
+
+        assert_ne!(store.servers[0].id, store.servers[1].id);
+        assert_eq!(store.servers[0].name, "a");
+        assert_eq!(store.servers[1].name, "b");
     }
 
     #[test]
-    fn repair_fills_empty_group_and_is_idempotent() {
+    fn assign_ids_fills_empty_group() {
         let mut store = Store {
             groups: vec![DEFAULT_GROUP.to_string()],
             servers: vec![server("x", "   ", "a")],
         };
-        assert_eq!(store.repair(), 1);
+        store.assign_ids();
         assert_eq!(store.servers[0].group, DEFAULT_GROUP);
-        assert_eq!(store.repair(), 0, "修好之后再修应该无事可做");
     }
 
     #[test]
